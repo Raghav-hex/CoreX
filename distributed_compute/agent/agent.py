@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("agent")
 
 # --- Configuration ---
-AGENT_ID = "agent-001"
+AGENT_ID = "agent-002"
 SCHEDULER_URL = "ws://localhost:8000/agents/connect"
 # NEW: Initialize the Docker client
 docker_client = docker.from_env()
