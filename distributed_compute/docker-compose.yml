@@ -1,7 +1,6 @@
-
+# docker-compose.yml
 
 services:
-  # The Redis service for our job queue
   redis:
     image: "redis:alpine"
     ports:
@@ -9,11 +8,10 @@ services:
     volumes:
       - redis_data:/data
 
-  # [NEW] The PostgreSQL database service
   postgres:
     image: "postgres:15-alpine"
     ports:
-      - "5432:5432" # Expose the port for potential local connections
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
@@ -21,17 +19,40 @@ services:
       - POSTGRES_PASSWORD=secret
       - POSTGRES_DB=distributed_compute
 
-  # The Scheduler service, which will run our Python code
   scheduler:
     build: ./scheduler
     ports:
       - "8000:8000"
+      
     volumes:
       - ./scheduler:/app
     depends_on:
       - redis
-      - postgres # [UPDATED] Ensures Postgres starts before the scheduler
+      - postgres
+
+  # [NEW] The Prometheus service
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090" # Web UI for Prometheus
+    volumes:
+      - ./prometheus:/etc/prometheus/ # Mount our config file
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    depends_on:
+      - scheduler
+
+  # [NEW] The Grafana service
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000" # Web UI for Grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
 
 volumes:
   redis_data:
-  postgres_data: # [NEW] Define a persistent volume for Postgres data
+  postgres_data:
+  grafana_data:

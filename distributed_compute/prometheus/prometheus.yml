@@ -1,0 +1,11 @@
+# prometheus/prometheus.yml
+
+global:
+  scrape_interval: 15s # Scrape metrics every 15 seconds
+
+scrape_configs:
+  - job_name: 'scheduler'
+    static_configs:
+      # "scheduler:9000" is the address of our scheduler's metrics endpoint
+      # inside the Docker network.
+      - targets: ['scheduler:8000']
