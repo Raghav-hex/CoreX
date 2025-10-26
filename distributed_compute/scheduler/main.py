@@ -2,63 +2,89 @@
 
 import logging
 import asyncio
+import json
+import redis.asyncio as redis # [UPDATED] Use the async version of the redis library
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from pydantic import BaseModel # NEW: For data validation
+from pydantic import BaseModel
 
 # --- Basic Setup ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scheduler")
 app = FastAPI()
 
-# --- In-Memory State (for our simple MVP) ---
-active_connections = {} # Stores agent_id -> WebSocket
-job_database = {}       # NEW: A simple dict to act as our job database
+# --- Redis Connection ---
+# [NEW] Connect to the Redis server. "redis" is the hostname we defined in docker-compose.yml.
+redis_client = redis.Redis.from_url("redis://redis:6379", decode_responses=True)
 
-# --- NEW: Data Models for API ---
-# This defines what a "Job" looks like when a user submits it.
-# FastAPI will automatically validate the incoming data against this model.
+# --- In-Memory State ---
+active_connections = {}
+
+# --- Data Models ---
 class Job(BaseModel):
     command: str
-    image: str = "alpine:latest" # Default to a small, common Docker image
+    image: str = "alpine:latest"
 
-# --- NEW: REST API Endpoint for Job Submission ---
+# --- [UPDATED] Job Submission Endpoint ---
+# This endpoint now just adds the job to the Redis queue.
 @app.post("/jobs")
 async def submit_job(job: Job):
-    if not active_connections:
-        raise HTTPException(status_code=503, detail="No agents are available to accept jobs.")
-
-    # Find the first available (idle) agent. This is a very simple scheduling strategy.
-    agent_id_to_use = next(iter(active_connections))
-    agent_websocket = active_connections[agent_id_to_use]
-
-    # Create a unique ID for the job
-    job_id = f"job-{len(job_database) + 1}"
-    job_database[job_id] = {"status": "assigned", "agent_id": agent_id_to_use}
-
-    # The task message we will send to the agent
-    task_data = {
-        "type": "task_assignment",
+    job_id = f"job-{await redis_client.incr('job_counter')}"
+    job_data = {
         "task_id": job_id,
         "image": job.image,
         "command": job.command
     }
+    
+    # 'lpush' adds the job to the left side of a list (our queue)
+    await redis_client.lpush("job_queue", json.dumps(job_data))
+    
+    logger.info(f"Queued job '{job_id}'")
+    return {"job_id": job_id, "status": "Job successfully queued"}
 
-    try:
-        await agent_websocket.send_json(task_data)
-        logger.info(f"Assigned task '{job_id}' to agent '{agent_id_to_use}'")
-        return {"job_id": job_id, "status": "Job assigned successfully"}
-    except Exception as e:
-        logger.error(f"Failed to send task to agent '{agent_id_to_use}': {e}")
-        job_database[job_id]["status"] = "failed_to_assign"
-        raise HTTPException(status_code=500, detail="Failed to communicate with agent.")
+# --- [NEW] Background Worker for Scheduling ---
+async def schedule_jobs_periodically():
+    logger.info("Starting job scheduler worker...")
+    while True:
+        try:
+            # 'brpop' is a blocking pop. It waits until a job is available in the queue.
+            # This is very efficient as it doesn't constantly poll.
+            _ , job_data_str = await redis_client.brpop("job_queue")
+            job_data = json.loads(job_data_str)
+            job_id = job_data["task_id"]
+            
+            logger.info(f"Popped job '{job_id}' from queue. Looking for an agent.")
 
+            if not active_connections:
+                logger.warning(f"No agents available for job '{job_id}'. Re-queuing job.")
+                # Re-queue the job if no agents are online
+                await redis_client.lpush("job_queue", json.dumps(job_data))
+                await asyncio.sleep(5) # Wait a bit before checking again
+                continue
 
-# --- UPDATED: WebSocket Endpoint ---
+            # Simple scheduling: assign to the first available agent
+            agent_id_to_use = next(iter(active_connections))
+            agent_websocket = active_connections[agent_id_to_use]
+
+            task_data = { "type": "task_assignment", **job_data }
+            
+            await agent_websocket.send_json(task_data)
+            logger.info(f"Assigned task '{job_id}' to agent '{agent_id_to_use}'")
+
+        except Exception as e:
+            logger.error(f"Error in scheduler worker: {e}")
+            await asyncio.sleep(5) # Avoid rapid-fire loops on persistent errors
+
+# --- [NEW] FastAPI Startup Event ---
+# This tells FastAPI to run our background worker when the application starts.
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(schedule_jobs_periodically())
+
+# --- WebSocket Endpoint (no changes needed here) ---
 @app.websocket("/agents/connect")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     agent_id = None
-
     try:
         registration_message = await websocket.receive_json()
         if registration_message.get("type") == "register":
@@ -66,31 +92,21 @@ async def websocket_endpoint(websocket: WebSocket):
             if agent_id:
                 active_connections[agent_id] = websocket
                 logger.info(f"Agent '{agent_id}' connected. Total agents: {len(active_connections)}")
-                await websocket.send_json({"status": "success", "message": "Registration successful"})
+                await websocket.send_json({"status": "success"})
             else:
-                await websocket.close(code=1008, reason="Agent ID is required")
+                await websocket.close(code=1008)
                 return
         else:
-            await websocket.close(code=1008, reason="First message must be a registration message.")
+            await websocket.close(code=1008)
             return
-
-        # UPDATED: Listen for more than just heartbeats
+        
         while True:
             message = await websocket.receive_json()
             msg_type = message.get("type")
-            
-            if msg_type == "heartbeat":
-                logger.info(f"Received heartbeat from '{agent_id}'")
-            
-            elif msg_type == "task_result":
+            if msg_type == "task_result":
                 task_id = message.get("task_id")
                 result = message.get("result")
-                logger.info(f"Received result for task '{task_id}': {result}")
-                if task_id in job_database:
-                    job_database[task_id]["status"] = "completed"
-                    job_database[task_id]["result"] = result
-            else:
-                logger.warning(f"Received unknown message type from '{agent_id}': {msg_type}")
+                logger.info(f"Received result for task '{task_id}': {result['logs']}")
 
     except WebSocketDisconnect:
         if agent_id and agent_id in active_connections:

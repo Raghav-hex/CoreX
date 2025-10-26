@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  # The Redis service for our job queue
+  redis:
+    image: "redis:alpine"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # The Scheduler service, which will run our Python code
+  scheduler:
+    build: ./scheduler  # Tells Docker Compose to build an image from the 'scheduler' folder
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./scheduler:/app # Mounts our local code into the container for live updates
+    depends_on:
+      - redis # Ensures Redis starts before the scheduler
+
+volumes:
+  redis_data: # This defines a persistent volume for Redis data
