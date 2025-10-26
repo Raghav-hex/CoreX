@@ -1,99 +1,123 @@
-# agent/agent.py
+# agent/agent.py (With Preemption Logic)
 
 import asyncio
 import websockets
 import json
 import psutil
 import logging
-import docker # NEW: To interact with the Docker daemon
+import docker
+import threading # [NEW] To run the Docker task in the background
+import keyboard  # [NEW] To detect user activity
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("agent")
 
 # --- Configuration ---
-AGENT_ID = "agent-002"
+AGENT_ID = "agent-002" # Remember to change this to "agent-002" for your second agent
 SCHEDULER_URL = "ws://localhost:8000/agents/connect"
-# NEW: Initialize the Docker client
 docker_client = docker.from_env()
 
-# --- NEW: Task Execution Logic ---
-def execute_task(task_id: str, image: str, command: str):
-    """Runs a command inside a new Docker container and returns the logs."""
+# --- [NEW] Global state to track the current task ---
+current_task_container = None
+current_task_id = None
+
+# --- [UPDATED] Task Execution Logic ---
+def execute_task(task_id: str, image: str, command: str, websocket):
+    global current_task_container, current_task_id
+    
     logger.info(f"Executing task '{task_id}': Running '{command}' in image '{image}'")
     try:
-        # Pull the image to make sure it's available.
-        # In a real system, you might handle this more gracefully.
-        logger.info(f"Pulling Docker image: {image}...")
-        docker_client.images.pull(image)
-        
-        # Run the container. This is the core of the execution.
+        current_task_id = task_id
         container = docker_client.containers.run(
             image=image,
             command=command,
-            detach=False, # We set detach=False to wait for it to complete
-            remove=True    # Automatically remove the container when it's done
+            detach=True, # [UPDATED] Detach to run in the background
+            remove=True
         )
-
-        # The result is the container's log output.
-        # We decode it from bytes to a string.
-        result_logs = container.decode('utf-8')
-        logger.info(f"Task '{task_id}' completed successfully.")
-        return {"status": "success", "logs": result_logs.strip()}
+        current_task_container = container
         
-    except docker.errors.ContainerError as e:
-        logger.error(f"Task '{task_id}' failed with a container error: {e}")
-        return {"status": "error", "logs": str(e)}
-    except docker.errors.ImageNotFound:
-        logger.error(f"Task '{task_id}' failed because image '{image}' was not found.")
-        return {"status": "error", "logs": f"Image not found: {image}"}
+        # Wait for the container to finish
+        result = container.wait()
+        logs = container.logs().decode('utf-8')
+        
+        # If we reach here, the task completed normally (wasn't preempted)
+        logger.info(f"Task '{task_id}' completed successfully.")
+        
+        # Send result back to scheduler in a thread-safe way
+        asyncio.run(websocket.send(json.dumps({
+            "type": "task_result", "task_id": task_id, "result": {"status": "success", "logs": logs.strip()}
+        })))
+
+    except docker.errors.NotFound:
+        # This can happen if we preemptively stop the container
+        logger.warning(f"Container for task '{task_id}' was stopped or removed before completion (likely preempted).")
     except Exception as e:
         logger.error(f"An unexpected error occurred during task '{task_id}': {e}")
-        return {"status": "error", "logs": str(e)}
+        asyncio.run(websocket.send(json.dumps({
+            "type": "task_result", "task_id": task_id, "result": {"status": "error", "logs": str(e)}
+        })))
+    finally:
+        # Clear the global state once the task is done
+        current_task_container = None
+        current_task_id = None
 
-# --- UPDATED: Main Agent Loop ---
+# --- [NEW] Owner Activity Detection ---
+def listen_for_preemption(websocket):
+    logger.info("Listening for owner activity (press ANY key to preempt)...")
+    keyboard.read_key(suppress=True) # This will block until a key is pressed
+    
+    global current_task_container, current_task_id
+    if current_task_container:
+        logger.warning(f"OWNER ACTIVITY DETECTED! Preempting task '{current_task_id}'.")
+        try:
+            current_task_container.stop()
+            # Send a preemption message to the scheduler
+            asyncio.run(websocket.send(json.dumps({
+                "type": "task_preempted", "task_id": current_task_id
+            })))
+        except Exception as e:
+            logger.error(f"Error while stopping container: {e}")
+    else:
+        logger.info("Owner activity detected, but no task is currently running.")
+
+# --- [UPDATED] Main Agent Loop ---
 async def agent_main_loop():
     while True:
         try:
             async with websockets.connect(SCHEDULER_URL) as websocket:
-                logger.info(f"Connected to scheduler.")
+                logger.info("Connected to scheduler.")
 
-                # Register with the scheduler
+                # Register with scheduler
                 await websocket.send(json.dumps({
-                    "type": "register",
-                    "agent_id": AGENT_ID,
+                    "type": "register", "agent_id": AGENT_ID,
                     "resources": {"cpu_cores": psutil.cpu_count()}
                 }))
-                response = await websocket.recv()
-                logger.info(f"Scheduler response: {response}")
+                await websocket.recv() # Wait for ack
 
-                # Listen for messages from the scheduler (tasks, etc.)
+                # Main loop to listen for task assignments
                 async for message_str in websocket:
                     message = json.loads(message_str)
-                    msg_type = message.get("type")
-
-                    if msg_type == "task_assignment":
+                    if message.get("type") == "task_assignment":
                         task_id = message.get("task_id")
                         logger.info(f"Received task assignment: {task_id}")
                         
-                        # Execute the task
-                        result = execute_task(task_id, message["image"], message["command"])
+                        # Start the Docker task in a separate thread
+                        task_thread = threading.Thread(
+                            target=execute_task,
+                            args=(task_id, message["image"], message["command"], websocket)
+                        )
+                        task_thread.start()
                         
-                        # Send the result back to the scheduler
-                        await websocket.send(json.dumps({
-                            "type": "task_result",
-                            "task_id": task_id,
-                            "result": result
-                        }))
-                    else:
-                        logger.warning(f"Received unknown message type: {msg_type}")
+                        # Immediately start listening for preemption in another thread
+                        preemption_thread = threading.Thread(
+                            target=listen_for_preemption, args=(websocket,)
+                        )
+                        preemption_thread.start()
         
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Connection lost. Reconnecting in 5 seconds...")
         except Exception as e:
             logger.error(f"An error occurred: {e}. Reconnecting in 5 seconds...")
-        
-        await asyncio.sleep(5)
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(agent_main_loop())
