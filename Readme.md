@@ -1,1 +1,1 @@
-This is a test commit.
+This is a patform for ML and Data Science developers to share and recieve compute power for their Projecs and work.
