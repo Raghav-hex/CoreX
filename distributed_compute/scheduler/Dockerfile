@@ -1,12 +1,9 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-slim
+# scheduler/Dockerfile
 
-# Set the working directory in the container
+FROM python:3.11-slim
 WORKDIR /app
 
-# Install Python dependencies
-RUN pip install "fastapi[all]" websockets redis
+# [UPDATED] Add the new libraries here
+RUN pip install "fastapi[all]" websockets redis "psycopg[binary]" asyncpg sqlalchemy
 
-# The command to run when the container launches
-# It's the same uvicorn command we ran manually before
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

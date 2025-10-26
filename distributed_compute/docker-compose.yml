@@ -1,4 +1,4 @@
-version: '3.8'
+
 
 services:
   # The Redis service for our job queue
@@ -9,15 +9,29 @@ services:
     volumes:
       - redis_data:/data
 
+  # [NEW] The PostgreSQL database service
+  postgres:
+    image: "postgres:15-alpine"
+    ports:
+      - "5432:5432" # Expose the port for potential local connections
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=distributed_compute
+
   # The Scheduler service, which will run our Python code
   scheduler:
-    build: ./scheduler  # Tells Docker Compose to build an image from the 'scheduler' folder
+    build: ./scheduler
     ports:
       - "8000:8000"
     volumes:
-      - ./scheduler:/app # Mounts our local code into the container for live updates
+      - ./scheduler:/app
     depends_on:
-      - redis # Ensures Redis starts before the scheduler
+      - redis
+      - postgres # [UPDATED] Ensures Postgres starts before the scheduler
 
 volumes:
-  redis_data: # This defines a persistent volume for Redis data
+  redis_data:
+  postgres_data: # [NEW] Define a persistent volume for Postgres data
